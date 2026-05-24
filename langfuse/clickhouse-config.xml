@@ -1,0 +1,38 @@
+<!-- ClickHouse single-node Keeper configuration for Langfuse v3.
+     Enables built-in Keeper so ReplicatedMergeTree tables work
+     without external ZooKeeper. -->
+<clickhouse>
+    <keeper_server>
+        <tcp_port>9181</tcp_port>
+        <server_id>1</server_id>
+        <log_storage_path>/var/lib/clickhouse/coordination/log</log_storage_path>
+        <snapshot_storage_path>/var/lib/clickhouse/coordination/snapshots</snapshot_storage_path>
+        <coordination_settings>
+            <operation_timeout_ms>10000</operation_timeout_ms>
+            <session_timeout_ms>30000</session_timeout_ms>
+            <raft_logs_level>warning</raft_logs_level>
+        </coordination_settings>
+        <raft_configuration>
+            <server>
+                <id>1</id>
+                <hostname>localhost</hostname>
+                <port>9234</port>
+            </server>
+        </raft_configuration>
+    </keeper_server>
+
+    <!-- Tell ClickHouse to use its own built-in Keeper -->
+    <zookeeper>
+        <node>
+            <host>localhost</host>
+            <port>9181</port>
+        </node>
+    </zookeeper>
+
+    <!-- Macros used by ReplicatedMergeTree ON CLUSTER default -->
+    <macros>
+        <shard>1</shard>
+        <replica>1</replica>
+        <cluster>default</cluster>
+    </macros>
+</clickhouse>

@@ -1,0 +1,5 @@
+sentence-transformers
+qdrant-client==1.9.1
+sqlalchemy
+psycopg2-binary
+python-json-logger>=2.0.0

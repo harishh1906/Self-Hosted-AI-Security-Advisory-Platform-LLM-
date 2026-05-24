@@ -1,0 +1,17 @@
+
+fastapi
+uvicorn
+requests
+pydantic
+sentence-transformers
+qdrant-client==1.9.1
+
+sqlalchemy
+psycopg2-binary
+python-jose[cryptography]
+
+# Production monitoring
+python-json-logger
+
+# LLM observability (disabled at runtime unless LANGFUSE_PUBLIC_KEY is set)
+langfuse>=3.0.0

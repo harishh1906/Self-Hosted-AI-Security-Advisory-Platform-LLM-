@@ -1,0 +1,383 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: virtue-ollama
+    restart: unless-stopped
+    # ── GPU Passthrough (NVIDIA Quadro P1000, 4GB VRAM) ──
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+        limits:
+          memory: 12g          # Cap Ollama host-RAM to 12 GB (model layers that spill from VRAM)
+    environment:
+      # ── Tuned for Quadro P1000 (4 GB VRAM, Compute 6.1) ──
+      OLLAMA_NUM_PARALLEL: 1          # Single request at a time — prevents VRAM OOM
+      OLLAMA_MAX_LOADED_MODELS: 1     # Only one model in VRAM at a time
+      OLLAMA_GPU_LAYERS: 999          # Offload as many layers to GPU as possible
+      OLLAMA_FLASH_ATTENTION: 1       # Enable Flash Attention for memory efficiency
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    ports:
+      - "11435:11434"
+    volumes:
+      - ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s            # Ollama needs time to load model into VRAM
+
+  advisory-api:
+    build: ./advisory-api
+    container_name: virtue-advisory
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_started
+      qdrant:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 4g               # Embedding model + FastAPI + SQLAlchemy
+          cpus: "4"                 # Half the 8 Xeon cores
+    environment:
+      SERVICE_SECRET_KEY: ${SERVICE_SECRET_KEY:-CHANGE_THIS_IN_PRODUCTION}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-CHANGE_THIS_IN_PROD}
+      DEFAULT_MODEL_NAME: gemma4:e2b
+      OLLAMA_BASE_URL: http://ollama:11434
+      DATABASE_URL: postgresql://virtue:${POSTGRES_PASSWORD:-virtuepass}@postgres:5432/virtue
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: 6333
+      # ── Server-tuned LLM parameters ──
+      LLM_REQUEST_TIMEOUT: 300     # 5 min — Gemma 4 on partial-GPU offload can be slow
+      LLM_NUM_PREDICT: 512         # Output token cap (saves VRAM)
+      LLM_NUM_CTX: 4096            # Context window (fits in 4 GB VRAM with quantized model)
+      LLM_TEMPERATURE: "0.2"       # Deterministic output for security advisories
+      # ── Concurrency guard ──
+      UVICORN_WORKERS: 1           # Single worker — serializes LLM calls to prevent VRAM OOM
+      # ── Langfuse LLM observability (opt-in: leave blank to disable) ──
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_BASE_URL: ${LANGFUSE_BASE_URL:-http://langfuse-web:3000}
+    ports:
+      - "8000:8000"
+    volumes:
+      - knowledge_inbox:/data/knowledge-inbox
+
+  qdrant:
+    image: qdrant/qdrant:v1.9.1
+    container_name: virtue-qdrant
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1g               # 384-dim vectors, small knowledge base
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    # Healthcheck removed due to missing tools in official image
+  
+  postgres:
+    image: postgres:15
+    container_name: virtue-postgres
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    environment:
+      POSTGRES_DB: virtue
+      POSTGRES_USER: virtue
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-virtuepass}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    command:
+      # ── Tuned for 32 GB server with ~2 GB Postgres allocation ──
+      - "postgres"
+      - "-c"
+      - "shared_buffers=512MB"
+      - "-c"
+      - "effective_cache_size=1GB"
+      - "-c"
+      - "work_mem=16MB"
+      - "-c"
+      - "max_connections=50"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U virtue -d virtue"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Knowledge Auto-Update Services ──
+  # Keeps RAG knowledge base current WITHOUT exposing LLM to internet
+
+  knowledge-fetcher:
+    build: ./knowledge-fetcher
+    container_name: virtue-kb-fetcher
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "1"
+    environment:
+      NVD_API_KEY: ${NVD_API_KEY:-}
+      FETCH_INTERVAL_HOURS: ${KB_FETCH_INTERVAL_HOURS:-6}
+      INBOX_PATH: /data/knowledge-inbox
+    volumes:
+      - knowledge_inbox:/data/knowledge-inbox
+    # SECURITY: No access to qdrant, postgres, ollama — internet-facing only
+
+  knowledge-ingester:
+    build: ./knowledge-ingester
+    container_name: virtue-kb-ingester
+    restart: unless-stopped
+    depends_on:
+      qdrant:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 2g               # Embedding model (~1.5GB) + processing
+          cpus: "2"
+    environment:
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: 6333
+      DATABASE_URL: postgresql://virtue:${POSTGRES_PASSWORD:-virtuepass}@postgres:5432/virtue
+      INBOX_PATH: /data/knowledge-inbox
+      POLL_INTERVAL_SECONDS: ${KB_POLL_INTERVAL_SECONDS:-60}
+    volumes:
+      - knowledge_inbox:/data/knowledge-inbox    # Shared volume: fetcher writes, ingester reads and moves to .processed
+    # SECURITY: No internet access, no ollama access — air-gapped
+
+  # ── Monitoring Dashboard ──
+  # Serves the React frontend and reverse-proxies API calls to advisory-api
+
+  dashboard:
+    build: ./dashboard
+    container_name: virtue-dashboard
+    restart: unless-stopped
+    depends_on:
+      advisory-api:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+          cpus: "0.5"
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3000/health-check"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── Langfuse LLM Observability Stack ──
+  # Self-hosted Langfuse v3 — provides tracing, prompt management, and evaluation
+  # for advisory-api LLM calls. All data stays on the local network (air-gap safe).
+  # Total memory: ~3.3 GB (fits within 32 GB server budget)
+
+  langfuse-web:
+    image: langfuse/langfuse:latest
+    container_name: virtue-langfuse
+    restart: unless-stopped
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_started
+      langfuse-redis:
+        condition: service_started
+      langfuse-minio:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1"
+    environment:
+      DATABASE_URL: postgresql://langfuse:${LANGFUSE_DB_PASSWORD:-langfusepass}@langfuse-postgres:5432/langfuse
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_MIGRATION_URL: clickhouse://default:${LANGFUSE_CH_PASSWORD:-langfuse_ch_pass}@langfuse-clickhouse:9000
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CH_PASSWORD:-langfuse_ch_pass}
+      REDIS_CONNECTION_STRING: redis://langfuse-redis:6379
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-changeme-langfuse-secret}
+      SALT: ${LANGFUSE_SALT:-changeme-langfuse-salt}
+      NEXTAUTH_URL: http://localhost:3001
+      TELEMETRY_ENABLED: "false"      # Air-gap: no outbound telemetry
+      # ── S3-compatible blob storage (MinIO) ──
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: us-east-1
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_MINIO_USER:-langfuse}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_PASSWORD:-langfuse-minio-pass}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse-media
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: us-east-1
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_MINIO_USER:-langfuse}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_PASSWORD:-langfuse-minio-pass}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      # Auto-provision project keys so advisory-api can connect on first boot
+      LANGFUSE_INIT_ORG_ID: "virtue-ai"
+      LANGFUSE_INIT_PROJECT_ID: "advisory-api"
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-virtue}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-virtue}
+    ports:
+      - "3001:3000"                    # 3001 to avoid conflict with dashboard on 3000
+    profiles:
+      - langfuse                       # Only starts with: docker compose --profile langfuse up
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:latest
+    container_name: virtue-langfuse-worker
+    restart: unless-stopped
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_started
+      langfuse-redis:
+        condition: service_started
+      langfuse-minio:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "0.5"
+    environment:
+      DATABASE_URL: postgresql://langfuse:${LANGFUSE_DB_PASSWORD:-langfusepass}@langfuse-postgres:5432/langfuse
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_MIGRATION_URL: clickhouse://default:${LANGFUSE_CH_PASSWORD:-langfuse_ch_pass}@langfuse-clickhouse:9000
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CH_PASSWORD:-langfuse_ch_pass}
+      REDIS_CONNECTION_STRING: redis://langfuse-redis:6379
+      # ── S3-compatible blob storage (MinIO) ──
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: us-east-1
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_MINIO_USER:-langfuse}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_PASSWORD:-langfuse-minio-pass}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse-media
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: us-east-1
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_MINIO_USER:-langfuse}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_PASSWORD:-langfuse-minio-pass}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+    profiles:
+      - langfuse
+
+  langfuse-postgres:
+    image: postgres:15
+    container_name: virtue-langfuse-pg
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    environment:
+      POSTGRES_DB: langfuse
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: ${LANGFUSE_DB_PASSWORD:-langfusepass}
+    volumes:
+      - langfuse_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse -d langfuse"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    profiles:
+      - langfuse
+
+  langfuse-clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: virtue-langfuse-ch
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+    environment:
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CH_PASSWORD:-langfuse_ch_pass}
+      CLICKHOUSE_DB: default
+    volumes:
+      - langfuse_ch_data:/var/lib/clickhouse
+      - ./langfuse/clickhouse-config.xml:/etc/clickhouse-server/config.d/keeper.xml:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    profiles:
+      - langfuse
+
+  langfuse-redis:
+    image: redis:7
+    container_name: virtue-langfuse-redis
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+    profiles:
+      - langfuse
+
+  langfuse-minio:
+    image: minio/minio:latest
+    container_name: virtue-langfuse-minio
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+    environment:
+      MINIO_ROOT_USER: ${LANGFUSE_MINIO_USER:-langfuse}
+      MINIO_ROOT_PASSWORD: ${LANGFUSE_MINIO_PASSWORD:-langfuse-minio-pass}
+    command: server /data --console-address ":9001"
+    volumes:
+      - langfuse_minio_data:/data
+    profiles:
+      - langfuse
+
+  langfuse-minio-init:
+    image: minio/mc:latest
+    container_name: virtue-langfuse-minio-init
+    depends_on:
+      langfuse-minio:
+        condition: service_started
+    environment:
+      MINIO_ROOT_USER: ${LANGFUSE_MINIO_USER:-langfuse}
+      MINIO_ROOT_PASSWORD: ${LANGFUSE_MINIO_PASSWORD:-langfuse-minio-pass}
+    entrypoint: /bin/sh
+    command: /init-minio.sh
+    volumes:
+      - ./langfuse/init-minio.sh:/init-minio.sh:ro
+    restart: "no"
+    profiles:
+      - langfuse
+
+volumes:
+  ollama:
+  qdrant_data:
+  postgres_data:
+  knowledge_inbox:       # Shared volume: fetcher writes, ingester reads
+  langfuse_pg_data:      # Langfuse metadata (Postgres)
+  langfuse_ch_data:      # Langfuse trace storage (ClickHouse)
+  langfuse_minio_data:   # Langfuse blob storage (MinIO)

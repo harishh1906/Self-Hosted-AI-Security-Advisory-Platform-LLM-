@@ -1,0 +1,59 @@
+# Python Artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Node/Frontend (Vite / React)
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Virtual Environments & Packages
+.venv/
+env/
+venv/
+ENV/
+build/
+*.egg-info/
+
+# Test & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+.nyc_output
+
+# Local Databases & Data
+*.db
+*.sqlite3
+docker-data/
+qdrant_storage/
+
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# LLM Models & Caches
+models/
+.ollama/
+.cache/
+*.gguf
+*.bin
+*.model
+
+# IDEs & System
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temp Files
+*.tmp
+*.resolved
