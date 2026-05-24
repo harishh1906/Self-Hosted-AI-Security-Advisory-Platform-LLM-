@@ -19,7 +19,7 @@ The system is split into two primary pipelines:
 
 ```mermaid
 flowchart TD
-    subgraph Ingestion Pipeline (Air-Gapped Bridge)
+    subgraph Ingest["Ingestion Pipeline (Air-Gapped Bridge)"]
         NVD[NVD CVE API 2.0] -->|Fetch delta| KF[knowledge-fetcher]
         CISA[CISA KEV Feed] -->|Fetch delta| KF
         KF -->|Atomic JSON Write| Inbox[(Shared inbox volume)]
@@ -28,7 +28,7 @@ flowchart TD
         KI -->|Audit Logs| PG[(PostgreSQL)]
     end
 
-    subgraph User / Scanner Inference Flow
+    subgraph Inference["User / Scanner Inference Flow"]
         User[Enterprise Security Team / Scanner] -->|POST /analyze| API[advisory-api]
         API -->|1. Authenticate Dual Keys| Auth[Auth Service]
         API -->|2. Fetch Org Policy| Cache[(Policy Cache)]
