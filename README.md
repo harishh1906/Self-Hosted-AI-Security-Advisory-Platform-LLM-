@@ -296,3 +296,43 @@ docker compose --profile langfuse up -d
 *   **Multimodal Evidence Ingestion:** Allow ingestion of system topology diagrams, source code snippets, and network packet capture (PCAP) images, feeding them to local vision LLMs for richer vulnerability mapping.
 *   **Federated GPU Inference Clusters:** Scale out VRAM capabilities by pooling idle GPU resources across the enterprise, distributing large-model inferences (e.g., 31B+ parameters) dynamically across a local cluster.
 *   **Self-Tuning Reinforcement Feedback Loops:** Leverage human analyst ratings of advisory quality to retrain small custom adapter checkpoints (LoRA) locally, systematically improving explanation style and risk scores over time.
+
+
+## Deployment Verification & Security Operations Checklist
+
+This checklist is intended for operators bringing up or reviewing the self-hosted stack. It is a verification aid, not a claim that a particular deployment has passed these checks.
+
+### Before starting
+
+- Review `.env.example` and provide environment-specific values through a local, access-controlled environment file or secret manager.
+- Keep database passwords, JWT signing material, HMAC keys, and other credentials out of Git history, logs, screenshots, and issue reports.
+- Confirm the host has sufficient CPU, memory, disk, and (when enabled) GPU resources for the selected model and container configuration.
+- Decide which services must be reachable from the host or internal network; do not expose databases, Qdrant, Ollama, or observability services publicly without an explicit security review.
+
+### Bring-up and verification
+
+1. Review the service definitions and environment variables in `docker-compose.yml` and `.env.example`.
+2. Start the stack with `docker compose up -d --build` from the repository root.
+3. Inspect service status with `docker compose ps` and investigate any container that repeatedly exits or restarts.
+4. Review logs with `docker compose logs --tail=200 <service>`; redact secrets before sharing output.
+5. Verify the API health/readiness route and OpenAPI documentation exposed by the running FastAPI service. Use the actual host/port mapping in your Compose configuration.
+6. Verify PostgreSQL connectivity, Qdrant collection availability, Ollama model availability, and Langfuse connectivity from the services that depend on them.
+7. Submit a non-sensitive test finding in a non-production environment and inspect the structured response and associated service logs.
+
+### Security review points
+
+- **Tenant isolation:** Confirm every retrieval path applies the expected `org_id` filter; test with two synthetic organizations and verify that one cannot retrieve the other's records.
+- **Service authentication:** Verify JWT and HMAC credentials are validated, rotated, and stored securely. Confirm the replay-prevention window is enforced by the running implementation.
+- **Network boundaries:** Restrict internal service ports to trusted networks and use authenticated access for operational dashboards.
+- **Input and output validation:** Confirm request schemas reject malformed input and advisory guardrails validate generated output before it is returned.
+- **Auditability:** Check that operational events and traces are useful without recording secrets or sensitive source data unnecessarily.
+
+### Reliability signals to monitor
+
+- API success/error rate and end-to-end latency, including the documented 8,000 ms target.
+- Ollama inference duration, model availability, and GPU/CPU memory pressure.
+- Qdrant query failures and circuit-breaker state.
+- PostgreSQL connection errors and persistence failures.
+- Guardrail rejection counts and drift indicators.
+
+When an issue occurs, capture the timestamp, affected service, sanitized logs, request correlation details, and the exact deployment revision. Do not include credentials or customer vulnerability data in public reports.
